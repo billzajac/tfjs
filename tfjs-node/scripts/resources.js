@@ -15,17 +15,19 @@
  * =============================================================================
  */
 
-const fs = require('fs');
-const http = require('http');
-const https = require('https');
-const HttpsProxyAgent = require('https-proxy-agent');
-const path = require('os').platform() === 'win32' ? require('path') :
-                                                    require('path').win32;
-const ProgressBar = require('progress');
-const tar = require('tar');
-const url = require('url');
-const util = require('util');
-const zip = require('adm-zip');
+const fs = require("fs");
+const http = require("http");
+const https = require("https");
+const HttpsProxyAgent = require("https-proxy-agent");
+const path =
+  require("os").platform() === "win32"
+    ? require("path")
+    : require("path").win32;
+const ProgressBar = require("progress");
+const tar = require("tar");
+const url = require("url");
+const util = require("util");
+const unzipper = require("unzipper"); // Use unzipper instead of adm-zip!
 
 const unlink = util.promisify(fs.unlink);
 
@@ -33,64 +35,86 @@ const unlink = util.promisify(fs.unlink);
  * Downloads and unpacks a given tarball or zip file at a given path.
  * @param {string} uri The path of the compressed file to download and extract.
  * @param {string} destPath The destination path for the compressed content.
- * @param {Function} callback Handler for when downloading and extraction is
- *     complete.
+ * @param {Function} callback Handler for when downloading and extraction is complete.
  */
 async function downloadAndUnpackResource(uri, destPath, callback) {
-  const httpClient = uri.startsWith('https') ? https : http;
+  const httpClient = uri.startsWith("https") ? https : http;
 
-  // If HTTPS_PROXY, https_proxy, HTTP_PROXY, or http_proxy is set
-  const proxy = process.env['HTTPS_PROXY'] || process.env['https_proxy'] ||
-      process.env['HTTP_PROXY'] || process.env['http_proxy'] || '';
+  const proxy =
+    process.env["HTTPS_PROXY"] ||
+    process.env["https_proxy"] ||
+    process.env["HTTP_PROXY"] ||
+    process.env["http_proxy"] ||
+    "";
 
-  // Using object destructuring to construct the options object for the
-  // http request.  the '...url.parse(targetUri)' part fills in the host,
-  // path, protocol, etc from the targetUri and then we set the agent to the
-  // default agent which is overridden a few lines down if there is a proxy
-  const options = {...url.parse(uri), agent: httpClient.globalAgent};
+  const options = { ...url.parse(uri), agent: httpClient.globalAgent };
 
-  if (proxy !== '') {
+  if (proxy !== "") {
     options.agent = new HttpsProxyAgent(proxy);
   }
 
-  const request = httpClient.get(options, response => {
-    const bar = new ProgressBar('[:bar] :rate/bps :percent :etas', {
-      complete: '=',
-      incomplete: ' ',
+  const request = httpClient.get(options, (response) => {
+    const totalSize = parseInt(response.headers["content-length"], 10);
+    const bar = new ProgressBar("[:bar] :rate/bps :percent :etas", {
+      complete: "=",
+      incomplete: " ",
       width: 30,
-      total: parseInt(response.headers['content-length'], 10)
+      total: totalSize,
     });
 
-    if (uri.endsWith('.zip')) {
-      // Save zip file to disk, extract, and delete the downloaded zip file.
-      const tempFileName = path.join(__dirname, '_tmp.zip');
+    if (uri.endsWith(".zip")) {
+      const tempFileName = path.join(__dirname, "_tmp.zip");
       const outputFile = fs.createWriteStream(tempFileName);
 
-      response.on('data', chunk => bar.tick(chunk.length))
-          .pipe(outputFile)
-          .on('close', async () => {
-            const zipFile = new zip(tempFileName);
-            zipFile.extractAllTo(destPath, true /* overwrite */);
+      response.on("data", (chunk) => bar.tick(chunk.length));
+      response.pipe(outputFile);
 
+      outputFile.on("close", async () => {
+        // After download is complete, extract
+        fs.createReadStream(tempFileName)
+          .pipe(unzipper.Extract({ path: destPath }))
+          .on("close", async () => {
+            await unlink(tempFileName); // Delete the temp file after extraction
+            if (callback !== undefined) {
+              callback();
+            }
+          })
+          .on("error", async (err) => {
+            console.error("Extraction error:", err);
             await unlink(tempFileName);
-
             if (callback !== undefined) {
-              callback();
+              callback(err);
             }
           });
-    } else if (uri.endsWith('.tar.gz')) {
-      response.on('data', chunk => bar.tick(chunk.length))
-          .pipe(tar.x({C: destPath, strict: true}))
-          .on('close', () => {
-            if (callback !== undefined) {
-              callback();
-            }
-          });
+      });
+    } else if (uri.endsWith(".tar.gz")) {
+      response.on("data", (chunk) => bar.tick(chunk.length));
+      response
+        .pipe(tar.x({ C: destPath, strict: true }))
+        .on("close", () => {
+          if (callback !== undefined) {
+            callback();
+          }
+        })
+        .on("error", (err) => {
+          console.error("Extraction error:", err);
+          if (callback !== undefined) {
+            callback(err);
+          }
+        });
     } else {
       throw new Error(`Unsupported packed resource: ${uri}`);
     }
   });
+
+  request.on("error", (err) => {
+    console.error("Request error:", err);
+    if (callback !== undefined) {
+      callback(err);
+    }
+  });
+
   request.end();
 }
 
-module.exports = {downloadAndUnpackResource};
+module.exports = { downloadAndUnpackResource };
